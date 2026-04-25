@@ -1,7 +1,11 @@
 """
 src/data_loader.py
 
-Načítání, čištění a time-series split XAUUSD dat.
+Načítání, čištění a time-series split dat (XAUUSD / EURUSD a další páry).
+
+Cílová proměnná:
+  - Pokud dataset obsahuje sloupec 'label_h1', použije se přímo jako 'target'.
+  - Jinak se target vypočítá: 1 pokud Close(t+1) > Close(t), jinak 0.
 """
 
 import pandas as pd
@@ -18,7 +22,7 @@ LEAKY_COLUMNS = [
     "pred_p_short", "pred_p_med", "pred_p_long", "pred_p_lgbm", "pred_p_l2",
     "pred_p_ens_eq", "pred_p_ens_iv", "pred_p_ens_eq_iso",
     "pred_thr_p55_ens", "pred_thr_p56_ens", "pred_thr_p57_ens", "pred_thr_p60_ens",
-    "label_h1",  # hotový label z budoucnosti
+    # label_h1 zde NENI – používáme ho jako target (přejmenován na 'target' v create_target)
 ]
 
 # Pomocné/identifikační sloupce, které nejsou features
@@ -71,15 +75,30 @@ load_csv = load_data
 
 def create_target(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Vytvoří binární target:
-        target = 1 pokud Close(t+1) > Close(t), jinak 0.
+    Nastaví sloupec 'target' (binární: 0 = Short, 1 = Long).
 
-    Poslední řádek nemá known budoucnost → odstraní se.
+    Strategie (v tomto pořadí):
+      1. Pokud existuje 'label_h1' → přejmenuje na 'target' (předpočítaný label).
+      2. Jinak vypočítá: 1 pokud Close(t+1) > Close(t), jinak 0.
+         Poslední řádek bez known budoucnosti je odstraněn.
     """
     df = df.copy()
-    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
-    # Poslední svíčka nemá label – odstraníme
-    df = df.iloc[:-1]
+    # Fallback target z Close – používá se pro řádky bez label_h1
+    close_target = (df["close"].shift(-1) > df["close"]).astype(int)
+    if "label_h1" in df.columns:
+        nan_count = df["label_h1"].isna().sum()
+        total = len(df)
+        if nan_count:
+            # Doplnit chybějící labely z Close shift – zachová všechna data
+            df["label_h1"] = df["label_h1"].fillna(close_target)
+            print(f"[data_loader] label_h1: {nan_count}/{total} NaN doplněno z Close shift.")
+        df["target"] = df["label_h1"].astype(int)
+        df = df.drop(columns=["label_h1"])
+        print(f"[data_loader] Target: použit sloupec 'label_h1' ({total - nan_count} H1 labelů, {nan_count} Close fallback).")
+    else:
+        df["target"] = close_target
+        df = df.iloc[:-1]  # poslední svíčka nemá label
+        print("[data_loader] Target: vypočítán z Close(t+1) > Close(t).")
     return df
 
 

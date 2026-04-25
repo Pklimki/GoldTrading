@@ -3,13 +3,14 @@ src/features.py
 
 Feature engineering, prioritizace a příprava X/y pro trénink.
 
-Prioritní skupiny signálů (doporučeno pro XAUUSD):
-  1. Orderflow   – f30_ofi_z200, lvl_liq_grab_*, lvl_swept_*
-  2. MTF         – f30_mtf_M15/H1/H4 pos_in_range, ret, body, trend_alignment
-  3. Volatilita  – atr14, eng_vol_rank_*, eng_atr_compression_*
-  4. Cenová akce – dist_ema_atr, close_vs_ema, pct_off_high/low
-  5. Engagement  – eng_ret_atr_*, eng_dir_consistency_*, eng_body_sum_atr_*
-  6. Úrovně      – lvl_prev_day_*, lvl_cur_day_*, lvl_hi/lo_*_dist_atr
+Prioritní skupiny signálů (EURUSD / FX páry):
+  1. Mean-Reversion & Extrémy – dist_ema_atr, range compression, frac_zscore
+  2. Lov likvidity              – lvl_swept_*, lvl_liq_grab_*
+  3. Orderflow / Mikro         – f30_ofi_z200, m1_vol_burst, m1_close_pos
+  4. MTF potvrzení             – f30_mtf_H1/H4 pos_in_range, trend_alignment
+  5. Volatilita & volume       – atr14, eng_vol_rank_*, atr_compression
+  6. Engagement (síla pohybu) – eng_ret_atr_*, eng_dir_consistency_*
+  7. Cenové úrovně             – lvl_prev_day_*, lvl_cur_day_*
 """
 
 import pandas as pd
@@ -18,44 +19,80 @@ from typing import List, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Šumivé / rizikové skupiny sloupců – tyto přispívají overfittingu
+# Šumivé / rizikové skupiny sloupců – absolutní ceny způsobují overfitting
 # ---------------------------------------------------------------------------
 NOISY_COLUMNS = [
-    # Redundantní raw OHLC (model má relativní verze normalizované ATR)
-    "open", "high", "low", "close",
-    # Absolutní objemy bez kontextu
-    "m1_m1_total_vol",
-    # Binární swept flags jsou redundantní k dist_atr verzím
-    # (ponecháme jen liq_grab a swept jako signály, ne samotné flags)
+    "open", "high", "low", "close",  # absolutní ceny – model dostává ATR verze
+    "m1_m1_total_vol",               # absolutní objem bez kontextu
 ]
 
 # ---------------------------------------------------------------------------
-# PRIORITNÍ skupiny features – seřazeny dle předpokládané prediktivní síly
+# EURUSD PRIORITNÍ skupiny features
 # ---------------------------------------------------------------------------
 
-# Skupina 1: Orderflow & likvidita
-ORDERFLOW_FEATURES = [
-    "f30_ofi_z200",
-    "lvl_liq_grab_up_3", "lvl_liq_grab_dn_3",
-    "lvl_liq_grab_up_5", "lvl_liq_grab_dn_5",
+# Skupina 1: Mean-Reversion & Extrémy
+# EURUSD je silně mean-reverting – vzdálenost od EMA je klíčový signál
+MEAN_REVERSION_FEATURES = [
+    "f30_dist_ema9_atr",    # přetažení od krátkodobého EMA
+    "f30_dist_ema21_atr",   # přetažení od střednědobého EMA
+    "f30_dist_ema50_atr",   # vzdálenost od dlouhodobého EMA
+    "f30_close_vs_ema9",
+    "f30_close_vs_ema21",
+    "lvl_range_compression_50",   # komprese range – předchází výbuchu / reverzi
+    "lvl_range_compression_200",
+    "f30_frac_zscore_50",   # z-score pozice close
+    "f30_pct_off_high_20",  # vzdálenost od 20-bar high
+    "f30_pct_off_low_20",   # vzdálenost od 20-bar low
+    "f30_nov_pct_off_high_20_atr",
+    "f30_nov_pct_off_low_20_atr",
+    "f30_close_pos",
+    "f30_frac_above_sma_5",
+]
+
+# Skupina 2: Lov likvidity (Liquidity Grabs)
+# EURUSD respektuje session highs/lows a PDH/PDL – sweepy jsou silné signály reverze
+LIQUIDITY_FEATURES = [
     "lvl_swept_prev_day_high", "lvl_swept_prev_day_low",
     "lvl_swept_cur_day_high", "lvl_swept_cur_day_low",
     "lvl_swept_cur_sess_high", "lvl_swept_cur_sess_low",
     "lvl_swept_hi_50", "lvl_swept_lo_50",
     "lvl_swept_hi_200", "lvl_swept_lo_200",
     "lvl_swept_hi_500", "lvl_swept_lo_500",
+    "lvl_liq_grab_up_3", "lvl_liq_grab_dn_3",
+    "lvl_liq_grab_up_5", "lvl_liq_grab_dn_5",
 ]
 
-# Skupina 2: Multi-timeframe (MTF)
+# Skupina 3: Orderflow & Mikro-dynamika
+ORDERFLOW_FEATURES = [
+    "f30_ofi_z200",               # order flow imbalance (hlavní signál)
+    "m1_m1_vol_burst",            # náhlý nárůst objemu na M1
+    "m1_m1_close_pos_in_range",   # kde zavřela M1 svíčka v range
+    "m1_m1_up_ratio",
+    "m1_m1_up_minus_dn",
+    "m1_m1_last_sign",
+    "m1_m1_last3_sign_sum",
+    "m1_m1_last3_body_atr",
+    "m1_m1_first_drive_atr",
+    "m1_m1_close_drive_atr",
+    "m1_m1_spread_burst",
+    "m1_m1_dist_from_high_atr",
+    "m1_m1_dist_from_low_atr",
+]
+
+# Skupina 4: Multi-timeframe potvrzení
 MTF_FEATURES = [
-    "f30_mtf_M15_pos_in_range", "f30_mtf_M15_ret", "f30_mtf_M15_body",
-    "f30_mtf_H1_pos_in_range", "f30_mtf_H1_ret", "f30_mtf_H1_body",
-    "f30_mtf_H4_pos_in_range",
-    "f30_mtf_trend_alignment",
+    "f30_mtf_H1_pos_in_range",   # kde je cena v rámci H1 svíčky
+    "f30_mtf_H1_ret",            # H1 return
+    "f30_mtf_H1_body",
+    "f30_mtf_H4_pos_in_range",   # H4 kontext (hlavní bias)
+    "f30_mtf_M15_pos_in_range",
+    "f30_mtf_M15_ret",
+    "f30_mtf_M15_body",
+    "f30_mtf_trend_alignment",   # zarovnání trendu přes TF
     "f30_m5_vs_h1_close",
 ]
 
-# Skupina 3: Volatilita & volume
+# Skupina 5: Volatilita & volume
 VOLATILITY_FEATURES = [
     "atr14",
     "eng_vol_rank_200", "eng_vol_rank_500", "eng_vol_rank_1000",
@@ -63,26 +100,10 @@ VOLATILITY_FEATURES = [
     "eng_vol_change_50",
     "eng_vol_slope_50",
     "lvl_atr_compression_50", "lvl_atr_compression_200", "lvl_atr_compression_500",
-    "lvl_range_compression_50", "lvl_range_compression_200",
     "f30_atrn_pos_20", "f30_atrn_body", "f30_atrn_ret_10",
 ]
 
-# Skupina 4: Cenová akce (normalizovaná ATR)
-PRICE_ACTION_FEATURES = [
-    "f30_dist_ema9_atr", "f30_dist_ema21_atr", "f30_dist_ema50_atr",
-    "f30_close_vs_ema9", "f30_close_vs_ema21",
-    "f30_close_pos",
-    "f30_pct_off_high_20", "f30_pct_off_low_20",
-    "f30_nov_pct_off_high_20_atr", "f30_nov_pct_off_low_20_atr",
-    "f30_nov_clv_ma5",
-    "f30_frac_zscore_50",
-    "f30_frac_above_sma_5",
-    "f30_frac_volret_roll50_k3", "f30_frac_volret_roll50_k5",
-    "f30_ix_adx14__x__bb_pos",
-    "f30_ix_dist_ema21_atr__x__adx14",
-]
-
-# Skupina 5: Engagement (síla pohybu)
+# Skupina 6: Engagement (síla a konzistence pohybu)
 ENGAGEMENT_FEATURES = [
     "eng_ret_atr_3", "eng_ret_atr_5", "eng_ret_atr_10",
     "eng_ret_atr_20", "eng_ret_atr_50",
@@ -93,9 +114,13 @@ ENGAGEMENT_FEATURES = [
     "eng_up_count_10", "eng_dn_count_10",
     "eng_consec_up_bars", "eng_consec_dn_bars",
     "eng_efficiency_10", "eng_efficiency_20", "eng_efficiency_50",
+    "f30_ix_adx14__x__bb_pos",
+    "f30_ix_dist_ema21_atr__x__adx14",
+    "f30_frac_volret_roll50_k3", "f30_frac_volret_roll50_k5",
+    "f30_nov_clv_ma5",
 ]
 
-# Skupina 6: Klíčové cenové úrovně (vzdálenosti normalizované ATR)
+# Skupina 7: Cenové úrovně (vzdálenosti normalizované ATR)
 LEVELS_FEATURES = [
     "lvl_prev_day_high_dist_atr", "lvl_prev_day_low_dist_atr", "lvl_prev_day_close_dist_atr",
     "lvl_cur_day_high_dist_atr", "lvl_cur_day_low_dist_atr",
@@ -106,28 +131,19 @@ LEVELS_FEATURES = [
     "lvl_hi_1000_dist_atr", "lvl_lo_1000_dist_atr",
     "eng_dist_high_50_atr", "eng_dist_low_50_atr",
     "eng_dist_high_200_atr", "eng_dist_low_200_atr",
-]
-
-# Skupina 7: M1 mikrostruktura
-M1_FEATURES = [
-    "m1_m1_up_ratio", "m1_m1_up_minus_dn",
     "m1_m1_sum_body_atr", "m1_m1_max_body_atr", "m1_m1_max_range_atr",
-    "m1_m1_vol_burst", "m1_m1_spread_burst", "m1_m1_max_spread",
-    "m1_m1_first_drive_atr", "m1_m1_close_drive_atr",
-    "m1_m1_last_sign", "m1_m1_last3_sign_sum", "m1_m1_last3_body_atr",
-    "m1_m1_close_pos_in_range",
-    "m1_m1_dist_from_high_atr", "m1_m1_dist_from_low_atr",
+    "m1_m1_max_spread",
 ]
 
 # Celkový seznam prioritních features (v pořadí skupin)
 PRIORITY_FEATURES: List[str] = (
-    ORDERFLOW_FEATURES
+    MEAN_REVERSION_FEATURES
+    + LIQUIDITY_FEATURES
+    + ORDERFLOW_FEATURES
     + MTF_FEATURES
     + VOLATILITY_FEATURES
-    + PRICE_ACTION_FEATURES
     + ENGAGEMENT_FEATURES
     + LEVELS_FEATURES
-    + M1_FEATURES
 )
 
 

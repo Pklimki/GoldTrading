@@ -148,3 +148,83 @@ def print_feature_importance(model: Any, feature_cols: List[str], top_n: int = 2
     print(f"  Top-{top_n} Feature Importance")
     print(f"{'='*50}")
     print(df_imp.to_string(index=False))
+
+
+def evaluate_dual_threshold(
+    model: Any,
+    X: pd.DataFrame,
+    y: pd.Series,
+    long_threshold: float = 0.52,
+    short_threshold: float = 0.48,
+    label: str = "Test",
+) -> Dict:
+    """
+    Duální threshold evaluace pro symetrické Long/Short predikce.
+
+    Logika:
+      - Long  signal: P(Long) >= long_threshold  (default 0.52)
+      - Short signal: P(Long) <= short_threshold (default 0.48, tj. P(Short) >= 0.52)
+      - Neutrální:    short_threshold < P(Long) < long_threshold → žádný vstup
+
+    Vypisuje statistiky zvlášť pro Long a Short signály + celkové pokrytí.
+    """
+    proba = model.predict_proba(X)[:, 1]
+    y_arr = y.to_numpy()
+
+    long_mask = proba >= long_threshold
+    short_mask = proba <= short_threshold
+    neutral_mask = ~long_mask & ~short_mask
+
+    total = len(y_arr)
+    n_long = long_mask.sum()
+    n_short = short_mask.sum()
+    n_neutral = neutral_mask.sum()
+    coverage = (n_long + n_short) / total
+
+    print(f"\n{'='*55}")
+    print(f"  {label} – Duální threshold evaluace")
+    print(f"  Long  thr ≥ {long_threshold}  |  Short thr ≤ {short_threshold}")
+    print(f"{'='*55}")
+    print(f"  Celkem bar: {total:,}  |  Pokrytí: {coverage:.1%} "
+          f"(Long: {n_long:,}, Short: {n_short:,}, Neutrál: {n_neutral:,})")
+
+    results: Dict = {"label": label, "coverage": coverage}
+
+    # --- Long signály ---
+    if n_long > 0:
+        y_long_true = y_arr[long_mask]
+        prec_long = y_long_true.mean()  # precision: podíl správných Long predikcí
+        print(f"\n  [LONG  ≥ {long_threshold}]  n={n_long:,}")
+        print(f"    Precision (správných vstupů): {prec_long:.4f}  "
+              f"({'✓' if prec_long > 0.5 else '✗'} > 50 %)")
+        results["long_n"] = int(n_long)
+        results["long_precision"] = float(prec_long)
+    else:
+        print(f"\n  [LONG  ≥ {long_threshold}]  Žádné signály – threshold příliš vysoký?")
+        results["long_n"] = 0
+        results["long_precision"] = float("nan")
+
+    # --- Short signály ---
+    if n_short > 0:
+        y_short_true = 1 - y_arr[short_mask]  # Short je správný, když target == 0
+        prec_short = y_short_true.mean()
+        print(f"\n  [SHORT ≤ {short_threshold}]  n={n_short:,}")
+        print(f"    Precision (správných vstupů): {prec_short:.4f}  "
+              f"({'✓' if prec_short > 0.5 else '✗'} > 50 %)")
+        results["short_n"] = int(n_short)
+        results["short_precision"] = float(prec_short)
+    else:
+        print(f"\n  [SHORT ≤ {short_threshold}]  Žádné signály – threshold příliš nízký?")
+        results["short_n"] = 0
+        results["short_precision"] = float("nan")
+
+    # --- Celkové AUC (bez threshold) ---
+    try:
+        auc = roc_auc_score(y_arr, proba)
+        print(f"\n  ROC-AUC (celkové): {auc:.4f}")
+        results["auc"] = float(auc)
+    except Exception:
+        pass
+
+    print()
+    return results
