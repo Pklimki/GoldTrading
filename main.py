@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.data_loader import load_and_prepare
-from src.features import add_engineered_features, select_features, prepare_Xy
+from src.features import add_engineered_features, select_priority_features, prepare_Xy
 from src.model import build_lgbm, build_xgb, save_model
 from src.train import (
     compute_class_weight_ratio,
@@ -31,11 +31,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="XAUUSD ML Predictor")
     parser.add_argument("--data", type=str, default="data/xauusd.csv", help="Cesta k CSV souboru")
     parser.add_argument("--model", choices=["lgbm", "xgb"], default="lgbm", help="Typ modelu")
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="Podíl dat pro trénink (0-1)")
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="Podíl dat pro trénink (0-1) – ignorováno, pokud jsou zadána data data")
+    parser.add_argument("--train-end", type=str, default="2023-12-31",
+                        help="Poslední datum tren. sady vrčetně (default: 2023-12-31)")
+    parser.add_argument("--test-start", type=str, default="2024-01-01",
+                        help="První datum test. sady (default: 2024-01-01, OOS)")
     parser.add_argument("--val-ratio", type=float, default=0.1,
                         help="Podíl z trénovacích dat pro validaci / early stopping")
-    parser.add_argument("--threshold", type=float, default=None,
-                        help="Klasifikační threshold (None = auto-optimalizace)")
+    parser.add_argument("--threshold", type=float, default=0.52,
+                        help="Klasifikační threshold (default: 0.52 – vyžaduje silnější konfirmaci)")
     parser.add_argument("--output", type=str, default=None, help="Cesta pro uložení modelu")
     return parser.parse_args()
 
@@ -47,9 +51,11 @@ def main() -> None:
     # 1. Načtení a příprava dat
     # -----------------------------------------------------------------------
     print("\n[1/5] Načítání dat...")
+    print(f"      Train: do {args.train_end} | Test (OOS): od {args.test_start}")
     train_df, test_df, feature_cols = load_and_prepare(
         filepath=args.data,
-        train_ratio=args.train_ratio,
+        train_end=args.train_end,
+        test_start=args.test_start,
     )
 
     # -----------------------------------------------------------------------
@@ -59,9 +65,8 @@ def main() -> None:
     train_df = add_engineered_features(train_df)
     test_df = add_engineered_features(test_df)
 
-    # Aktualizuj seznam features po přidání nových
-    all_cols = [c for c in train_df.columns if c != "target"]
-    feature_cols = select_features(train_df, all_cols)
+    # Použij prioritní feature set zaměřený na MTF a Orderflow
+    feature_cols = select_priority_features(train_df)
 
     # -----------------------------------------------------------------------
     # 3. Rozděl train → train + validace (pro early stopping / threshold tuning)
@@ -93,10 +98,13 @@ def main() -> None:
     # -----------------------------------------------------------------------
     print("\n[5/5] Evaluace...")
 
-    if args.threshold is None:
+    # S pevným thresholdem 0.52 vyžadujeme vyšší konfidenci před vstupem
+    # Auto-optimalizaci spusť explicitně předáním --threshold 0
+    if args.threshold == 0:
         threshold = find_optimal_threshold(model, X_val, y_val, metric="f1")
     else:
         threshold = args.threshold
+        print(f"[main] Threshold: {threshold} (pevný).")
 
     evaluate(model, X_val, y_val, threshold=threshold, label="Validace")
     evaluate(model, X_test, y_test, threshold=threshold, label="Test (OOS)")

@@ -28,15 +28,15 @@ def build_lgbm(class_weight_ratio: Optional[float] = None, **kwargs) -> Any:
         raise ImportError("Nainstaluj lightgbm: pip install lightgbm")
 
     default_params: Dict[str, Any] = {
-        "n_estimators": 500,
+        "n_estimators": 1000,          # víc stromů, early stopping zastaví dříve
         "learning_rate": 0.05,
-        "num_leaves": 63,
+        "num_leaves": 31,              # méně listů = méně komplexní = méně overfitting
         "max_depth": -1,
-        "min_child_samples": 50,
+        "min_child_samples": 100,      # každý list musí mít ≥100 vzorků v datech
         "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
+        "colsample_bytree": 0.7,       # náhodný výběr 70 % features per strom
+        "reg_alpha": 0.2,              # L1 regularizace
+        "reg_lambda": 0.5,             # L2 regularizace
         "random_state": 42,
         "n_jobs": -1,
         "verbose": -1,
