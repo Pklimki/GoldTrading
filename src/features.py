@@ -194,6 +194,46 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     if {"f30_mtf_H1_ret", "f30_mtf_H4_pos_in_range"}.issubset(df.columns):
         df["fe_h1ret_x_h4pos"] = df["f30_mtf_H1_ret"] * df["f30_mtf_H4_pos_in_range"]
 
+    # --- Session features (EURUSD likviditní seance – UTC čas) ---
+    # London:      07:00–12:00 UTC  (nejvyšší volume, trendy)
+    # NY/London:   13:00–17:00 UTC  (overlap – nejvyšší volatilita)
+    # NY afternoon:17:00–21:00 UTC
+    # Dead zone:   21:00–07:00 UTC  (Asie – nízký volume, chop)
+    if hasattr(df.index, "hour"):
+        hour = df.index.hour
+        df["fe_is_london"]    = ((hour >= 7)  & (hour < 13)).astype(int)
+        df["fe_is_ny_overlap"]= ((hour >= 13) & (hour < 17)).astype(int)
+        df["fe_is_dead"]      = ((hour >= 21) | (hour < 7)).astype(int)
+        # Ordinální session ID (0=dead, 1=london, 2=overlap, 3=ny_afternoon)
+        sess = pd.Series(0, index=df.index, dtype=int)
+        sess[(hour >= 7)  & (hour < 13)] = 1
+        sess[(hour >= 13) & (hour < 17)] = 2
+        sess[(hour >= 17) & (hour < 21)] = 3
+        df["fe_session_id"] = sess
+
+        # Vzdálenost od London open (první bar ≥ 07:00 UTC) – ATR normalizovaná
+        if "close" in df.columns and atr is not None:
+            day_key = df.index.floor("D")  # midnight UTC jako klíč pro groupby
+            # London open: první dostupný close v pásmu 07:00–09:00 UTC každý den
+            lon_open = (
+                df["close"]
+                .where((hour >= 7) & (hour < 9))
+                .groupby(day_key)
+                .transform("first")
+                .ffill()
+            )
+            df["fe_dist_london_open_atr"] = (df["close"] - lon_open) / atr
+
+            # NY open: první dostupný close v pásmu 13:00–15:00 UTC každý den
+            ny_open = (
+                df["close"]
+                .where((hour >= 13) & (hour < 15))
+                .groupby(day_key)
+                .transform("first")
+                .ffill()
+            )
+            df["fe_dist_ny_open_atr"] = (df["close"] - ny_open) / atr
+
     return df
 
 

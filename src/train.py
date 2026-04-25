@@ -226,5 +226,14 @@ def evaluate_dual_threshold(
     except Exception:
         pass
 
+    # --- Distribuce predikcí (klíč pro ladění thresholdů) ---
+    s = pd.Series(proba)
+    pcts = s.describe(percentiles=[0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99])
+    print(f"\n  Distribuce P(Long):")
+    print(f"    p01={pcts['1%']:.3f}  p05={pcts['5%']:.3f}  p10={pcts['10%']:.3f}  "
+          f"p25={pcts['25%']:.3f}  median={pcts['50%']:.3f}")
+    print(f"    p75={pcts['75%']:.3f}  p90={pcts['90%']:.3f}  p95={pcts['95%']:.3f}  "
+          f"p99={pcts['99%']:.3f}  max={pcts['max']:.3f}")
+
     print()
     return results
