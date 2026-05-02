@@ -10,11 +10,12 @@ import lightgbm as lgb
 # Registr konfigurací – klíč = jméno, hodnota = dict parametrů
 _CONFIGS: dict = {
     "default": dict(
-        n_estimators  = 1000,
-        learning_rate = 0.01,
-        max_depth     = 6,
-        num_leaves    = 31,
-        random_state  = 42,
+        n_estimators      = 1000,
+        learning_rate     = 0.01,
+        max_depth         = 6,
+        num_leaves        = 31,
+        min_child_samples = 50,    # jemnější vzorce v menším vzorku (bylo 20)
+        random_state      = 42,
     ),
     "conservative": dict(
         n_estimators  = 1500,

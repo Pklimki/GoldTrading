@@ -24,12 +24,14 @@ MODEL_PATH = "models/lgbm_clean_v1.pkl"
 OOS_START        = pd.Timestamp("2025-01-01 00:00:00", tz="UTC")
 TARGET_COL       = "preprocessed_target"
 
-SIGNAL_THRESHOLD = 0.50   # pravděpodobnostní práh pro Long signál
-TBM_HORIZON      = 60     # max počet svíček do exitu
-TBM_PT_MULT      = 2.0    # TP = close[T] + ATR * TBM_PT_MULT
-TBM_SL_MULT      = 1.5    # SL = close[T] - ATR * TBM_SL_MULT
-POINTS_PER_PIP   = 10     # 10 MT5 bodů = 1 pip EURUSD
-PIP_VALUE        = 0.0001  # 1 pip = 0.0001
+SIGNAL_THRESHOLD  = 0.50   # pravděpodobnostní práh pro Long signál
+TBM_HORIZON       = 24     # max počet M5 svíček do exitu (24 × 5 min = 120 min)
+TBM_PT_MULT       = 3.0    # TP = close[T] + ATR * TBM_PT_MULT
+TBM_SL_MULT       = 2.0    # SL = close[T] - ATR * TBM_SL_MULT
+FIXED_SPREAD_PIPS = 1.5    # konzervativní fixní spread
+PIP_VALUE         = 0.0001  # 1 pip = 0.0001
+# News filter: True = přeskoč vstupy 14:30–14:45 a 16:00–16:15 CET
+FILTER_NEWS       = False
 
 
 def _simulate_tbm(
@@ -58,7 +60,6 @@ def _simulate_tbm(
     open_arr   = oos["open"].values
     high_arr   = oos["high"].values
     low_arr    = oos["low"].values
-    spread_arr = oos["spread"].values
     atr14_arr  = oos["atr14"].values
 
     # Forward-looking windows: win_h[i, k] = high[i + k + 1], k = 0 … HORIZON-1
@@ -89,8 +90,8 @@ def _simulate_tbm(
     to_cls  = timeout_exit[sig_idx]      # close[T+HORIZON] pro každý signál
 
     # Entry a spread
-    entry_price = open_arr[sig_idx + 1]                    # open[T+1]
-    spread_pips = spread_arr[sig_idx + 1] / POINTS_PER_PIP  # reálný spread z dat
+    entry_price = open_arr[sig_idx + 1]                         # open[T+1]
+    spread_pips = np.full(len(sig_idx), FIXED_SPREAD_PIPS)      # fixní spread
 
     # Detekce prvního zasažení bariéry
     tp_hits  = wh >= tp_lev[:, None]   # (n_sig, HORIZON) bool
@@ -196,11 +197,22 @@ def main() -> None:
         if c.startswith("preprocessed_") and c != TARGET_COL
     ]
     X_oos    = oos[feat_cols]
-    prob1    = model.predict_proba(X_oos)[:, 1]
-    sig_mask = prob1 >= SIGNAL_THRESHOLD
+    prob1        = model.predict_proba(X_oos)[:, 1]
+    is_tradable  = (oos["preprocessed_is_tradable"].values == 1) \
+        if "preprocessed_is_tradable" in oos.columns \
+        else np.ones(len(oos), dtype=bool)
+    not_news     = ~((oos["preprocessed_news_window"].values == 1) & FILTER_NEWS) \
+        if "preprocessed_news_window" in oos.columns \
+        else np.ones(len(oos), dtype=bool)
+    sig_mask     = (prob1 >= SIGNAL_THRESHOLD) & is_tradable & not_news
 
-    print(f"\nSignály (threshold={SIGNAL_THRESHOLD}): {sig_mask.sum():,} Long signálů "
-          f"({sig_mask.mean()*100:.2f}% OOS barů)")
+    n_tradable = int(is_tradable.sum())
+    n_filtered = int((is_tradable & not_news).sum())
+    print(f"\nTradable bary: {n_tradable:,} ({n_tradable/len(oos)*100:.1f}% OOS dat)")
+    if FILTER_NEWS:
+        print(f"Po news filtru: {n_filtered:,} barů")
+    print(f"Signály (threshold={SIGNAL_THRESHOLD}): {sig_mask.sum():,} Long signálů "
+          f"({sig_mask.sum()/max(n_tradable, 1)*100:.2f}% tradable barů)")
 
     # ── TBM simulace Long obchodů ─────────────────────────────────────────────
     print(f"Simuluji TBM obchody (horizon={TBM_HORIZON} min, "
@@ -224,7 +236,7 @@ def main() -> None:
     print("  VÝSLEDKY PODLE PRAVDĚPODOBNOSTNÍHO PRAHU")
     print("=" * 62)
     for thr in [0.50, 0.52, 0.55, 0.60]:
-        thr_mask    = prob1[:len(sig_mask)] >= thr
+        thr_mask    = (prob1 >= thr) & is_tradable
         sub_trades  = _simulate_tbm(oos, thr_mask)
         if len(sub_trades) == 0:
             continue

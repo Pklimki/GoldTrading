@@ -31,11 +31,16 @@ ATR_LONG_PERIOD   = 100           # dlouhodobý ATR pro volatility compression
 PIP_SIZE          = 0.0001        # EURUSD: 1 pip = 0.0001
 CET_TZ      = "Europe/Berlin"   # CET (UTC+1) / CEST (UTC+2) s DST
 
-# Triple Barrier Method (TBM)
-TBM_HORIZON  = 60    # počet budoucích svíček (60 minut)
-TBM_PT_MULT  = 2.0   # Profit Taking bariéra = ATR(14) × TBM_PT_MULT
-TBM_SL_MULT  = 1.5   # Stop Loss bariéra  = ATR(14) × TBM_SL_MULT (asymetrické RRR)
-ATR_200_PERIOD = 200 # pro Vol Persistence feature
+# Triple Barrier Method (TBM)  –  24 M5 barů = 2 hodiny
+TBM_HORIZON  = 24    # počet budoucích M5 svíček (24 × 5 min = 120 min)
+TBM_PT_MULT  = 3.0   # Profit Taking bariéra = ATR(14) × TBM_PT_MULT
+TBM_SL_MULT  = 2.0   # Stop Loss bariéra  = ATR(14) × TBM_SL_MULT
+ATR_200_PERIOD    = 200   # pro Vol Persistence feature
+ATR_TRADABLE_PIPS = 1.5   # minimální ATR(14) v pipech pro is_tradable (uvolněno z 2.5)
+
+# News Filter – používá se v backtestu (ne v tréninku).
+# True = vynechá vstupy 14:30–14:45 a 16:00–16:15 CET (NFP, FOMC apod.)
+FILTER_NEWS = False
 
 
 # ── Pomocné funkce ─────────────────────────────────────────────────────────────
@@ -147,7 +152,19 @@ def main() -> None:
     df.index = pd.to_datetime(df["bar_ts_utc"], unit="s", utc=True)
     df.index.name = "datetime_utc"
     df = df.sort_index()
-    print(f"Načteno {len(df):,} řádků. Rozsah: {df.index.min()} → {df.index.max()}")
+    print(f"Načteno {len(df):,} M1 řádků. Rozsah: {df.index.min()} → {df.index.max()}")
+
+    # ── Resample M1 → M5 ──────────────────────────────────────────────────────
+    print("Resampluju M1 → M5 (5minutové svíčky)...")
+    df = df[["open", "high", "low", "close", "tick_volume", "spread"]].resample("5min").agg({
+        "open":        "first",
+        "high":        "max",
+        "low":         "min",
+        "close":       "last",
+        "tick_volume": "sum",
+        "spread":      "last",
+    }).dropna(subset=["open", "close"])
+    print(f"Po resamplu: {len(df):,} M5 řádků.")
 
     open_  = df["open"]
     high   = df["high"]
@@ -200,6 +217,12 @@ def main() -> None:
 
     # ── Volatilita: ATR normalizovaný cenou ────────────────────────────────────
     out["preprocessed_atr14_norm"] = atr14 / close
+
+    # Volatilitní filtr: 1 pokud ATR(14) > ATR_TRADABLE_PIPS – obchodovatelné podmínky
+    # Model (a backtest) budou obchodovat POUZE tyto bary.
+    out["preprocessed_is_tradable"] = (
+        (atr14 > ATR_TRADABLE_PIPS * PIP_SIZE).astype("float32")
+    )
 
     # ── Trend: logaritmus poměru close / EMA ──────────────────────────────────
     ema50  = close.ewm(span=EMA_SHORT, min_periods=EMA_SHORT,  adjust=False).mean()
@@ -357,7 +380,14 @@ def main() -> None:
     dow_angle = 2.0 * np.pi * dow_arr / 7.0
     out["preprocessed_dow_sin"] = np.sin(dow_angle).astype("float32")
     out["preprocessed_dow_cos"] = np.cos(dow_angle).astype("float32")
-
+    # News window: 1 = bar leží v rizikovém časovém pásmu zpráv (CET).
+    # V backtestu (pokud FILTER_NEWS=True) tyto bary přeskočí.
+    # 14:30–14:45 CET = 870–885 min,   16:00–16:15 CET = 960–975 min.
+    news_mask = (
+        ((cet_min_day >= 870) & (cet_min_day < 885))  # 14:30–14:45 CET
+        | ((cet_min_day >= 960) & (cet_min_day < 975))  # 16:00–16:15 CET
+    )
+    out["preprocessed_news_window"] = news_mask.astype("float32")
     # ── Smart Money Concepts (SMC) ─────────────────────────────────────────────
     # LEAKAGE GUARD: veškerá data z předchozích uzavřených svíček.
     #   close_t1     = close[T-1]  (uzavřená svíčka)
