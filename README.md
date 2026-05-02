@@ -220,25 +220,26 @@ Tři opakované cykly trénink → test bez data leakage:
 
 | Cyklus | Trénink | Test | AUC | N obchodů | Win% | Avg Pips |
 |---|---|---|---|---|---|---|
-| A | 2016–2022 | 2023 | 0.6072 | 5 264 | 41.0% | −1.37 |
-| B | 2016–2023 | 2024 | 0.6072 | 3 238 | 38.3% | −1.58 |
-| C | 2016–2024 | 2025+ | 0.6123 | 6 541 | 41.0% | −1.20 |
-| M15 C | 2016–2024 | 2025+ (M15) | 0.6994 | 2 749 | 42.5% | −1.02 |
+| A | 2016–2022 | 2023 | 0.6072 | 609 | 42.9% | −1.15 |
+| B | 2016–2023 | 2024 | 0.6072 | 321 | 46.7% | −0.47 |
+| C | 2016–2024 | 2025+ | 0.6123 | 431 | 43.6% | −0.89 |
+| M15 C | 2016–2024 | 2025+ (M15) | 0.6786 | 93 | 23.7% | −5.76 |
 
-TBM parametry: PT=3×ATR, SL=2×ATR, Spread=1.5 pip, Horizon=24 barů (M5) / 8 barů (M15).  
-Práh: dynamický (rolling 500 + 1.5σ). M15 dosahuje AUC 0.70, výrazně lepší separace.
+TBM parametry: PT=3×ATR, SL=2×ATR, Spread=1.5 pip, Horizon=24 barů M5 / 12 barů M15 (3 h).  
+Práh: dynamický (rolling 500 + **2.0σ**) + hard floor **prob1 > 0.50**.
 
-**Top-5 features (průměr přes cykly):** `range_24h`, `close_vs_7d_highlow`, `atr14_norm`, `dist_london_open`, **`vol_regime_zscore`** (nová #5)
+**Top-5 features (průměr přes cykly):** `range_24h`, `close_vs_7d_highlow`, `atr14_norm`, `dist_london_open`, **`vol_regime_zscore`** (nová #5)  
+`preprocessed_er` se v Top-10 M5 cyklů neobjevil; M15 cyklus Top-3 obsahuje `tick_log_ratio` (#3).
 
 ---
 
-## Poslední OOS výsledky (stress test walk-forward, dynamický práh σ=1.5)
+## Poslední OOS výsledky (stress test walk-forward, 2.0σ + floor 0.50)
 
 | Cyklus | Test | AUC | N obchodů | Win% | Avg Pips | Total Pips |
 |---|---|---|---|---|---|---|
-| A | 2023 | 0.6072 | 5 264 | 41.0% | −1.37 | −7 232 |
-| B | 2024 | 0.6072 | 3 238 | 38.3% | −1.58 | −5 122 |
-| C | 2025+ | 0.6123 | 6 541 | 41.0% | −1.20 | −7 852 |
-| M15 C | 2025+ (M15) | 0.6994 | 2 749 | 42.5% | −1.02 | −2 807 |
+| A | 2023 | 0.6072 | 609 | 42.9% | −1.15 | −702 |
+| B | 2024 | 0.6072 | 321 | 46.7% | −0.47 | −152 |
+| C | 2025+ | 0.6123 | 431 | 43.6% | −0.89 | −384 |
+| M15 C | 2025+ (M15) | 0.6786 | 93 | 23.7% | −5.76 | −536 |
 
-Výsledky ukazují konzistentní AUC ~0.61 napříč cykly. Statické prahy 0.55–0.60 dosahují precision 37–66 % (cyklus B thr=0.60: precision=66 %), ale velmi nízkou coverage. Dynamický práh generuje více obchodů, ale stále nedosahuje breakeven (nutná precision >60 % pro R:R=3:2).
+M5 cykly jsou blízko breakeven (nejlepší B: −0.47 pip/trade). M15 s 2.0σ + floor 0.50 generuje jen 93 obchodů s agresivní selekcí, ale TP rate klesá (18.3 % TP vs. 74.2 % SL) — hard floor 0.50 v kombinaci s M15 distribucí (p99=0.46) eliminuje téměř vše. Pro M15 produkci je nutné snížit floor nebo σ.

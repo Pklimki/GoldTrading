@@ -35,7 +35,7 @@ MODEL_TYPE        = "default"
 # Dynamický práh: vstupujeme jen do anomálií v distribuci predikce.
 # thr[t] = rolling_mean(prob1, DYNAMIC_WINDOW) + DYNAMIC_SIGMA × rolling_std
 DYNAMIC_WINDOW    = 500
-DYNAMIC_SIGMA     = 1.5
+DYNAMIC_SIGMA     = 2.0
 TBM_HORIZON       = 24    # M5 barů (24 × 5 min = 120 min)
 TBM_PT_MULT       = 3.0
 TBM_SL_MULT       = 2.0
@@ -211,7 +211,9 @@ def run_cycle(df: pd.DataFrame, cycle: dict, feat_cols: list, tbm_horizon: int =
         print(f"  {thr:>5.2f}  {pt:>7.4f}  {cov:>9.2f}%  {nl:>8,}")
     dyn_n   = int((prob1 >= dyn_thr).sum())
     dyn_cov = dyn_n / len(y_test) * 100
-    print(f"  {'dyn':>5}  {'—':>7}  {dyn_cov:>9.2f}%  {dyn_n:>8,}  (thr̄={dyn_thr.mean():.4f}, σ={DYNAMIC_SIGMA})")
+    valid_thr = dyn_thr[~np.isnan(dyn_thr)]
+    thr_mean = valid_thr.mean() if len(valid_thr) > 0 else float('nan')
+    print(f"  {'dyn':>5}  {'—':>7}  {dyn_cov:>9.2f}%  {dyn_n:>8,}  (thr̄={thr_mean:.4f}, σ={DYNAMIC_SIGMA})")
 
     # Backtest simulace
     is_tradable = (oos_df["preprocessed_is_tradable"].values == 1) \
@@ -221,7 +223,7 @@ def run_cycle(df: pd.DataFrame, cycle: dict, feat_cols: list, tbm_horizon: int =
         if "preprocessed_news_window" in oos_df.columns \
         else np.ones(len(oos_df), dtype=bool)
 
-    sig_mask = (prob1 >= dyn_thr) & is_tradable & not_news
+    sig_mask = (prob1 >= dyn_thr) & (prob1 > 0.50) & is_tradable & not_news
     trades   = simulate_tbm(oos_df, sig_mask, horizon=tbm_horizon)
 
     if len(trades) == 0:
@@ -348,13 +350,13 @@ def main() -> None:
     if os.path.exists(m15_path):
         print(f"\n{'═' * 70}")
         print(f"  M15 BONUS TEST – Cyklus C: Train 2016–2024  |  Test 2025+")
-        print(f"  TBM Horizon = 8 M15 barů (8 × 15 min = 120 min)")
+        print(f"  TBM Horizon = 12 M15 barů (12 × 15 min = 180 min)")
         print(f"{'═' * 70}")
         df_m15       = pd.read_parquet(m15_path)
         feat_m15     = [c for c in df_m15.columns
                         if c.startswith("preprocessed_") and c != TARGET_COL]
         print(f"  M15 data: {len(df_m15):,} řádků, {len(feat_m15)} features")
-        res_m15 = run_cycle(df_m15, CYCLES[2], feat_m15, tbm_horizon=8)
+        res_m15 = run_cycle(df_m15, CYCLES[2], feat_m15, tbm_horizon=12)
         if res_m15.get("n_trades", 0) > 0:
             print(f"\n  M15 Cyklus C: {res_m15['n_trades']:,} obchodů  |  "
                   f"WR={res_m15['win_rate']:.1f}%  |  "

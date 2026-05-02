@@ -39,7 +39,7 @@ CET_TZ      = "Europe/Berlin"   # CET (UTC+1) / CEST (UTC+2) s DST
 ER_WINDOW    = 10   # počet barů pro Efficiency Ratio (Kaufman ER)
 
 # Triple Barrier Method (TBM)  –  cílový čas = 120 minut
-_TBM_HORIZONS = {"5min": 24, "15min": 8, "1min": 120}
+_TBM_HORIZONS = {"5min": 24, "15min": 12, "1min": 120}
 TBM_HORIZON   = _TBM_HORIZONS.get(RESAMPLE_FREQ, 24)  # barů do exitu
 TBM_PT_MULT   = 3.0   # Profit Taking bariéra = ATR(14) × TBM_PT_MULT
 TBM_SL_MULT   = 2.0   # Stop Loss bariéra  = ATR(14) × TBM_SL_MULT
@@ -532,5 +532,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
