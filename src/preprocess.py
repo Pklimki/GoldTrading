@@ -13,8 +13,13 @@ Spuštění (z kořene projektu):
 import pandas as pd
 import numpy as np
 
-INPUT_PATH  = "data/EURUSD_M1_full.parquet"
-OUTPUT_PATH = "data/eurusd_clean.parquet"
+INPUT_PATH    = "data/EURUSD_M1_full.parquet"
+RESAMPLE_FREQ = "5min"   # cílový timeframe: "5min" = M5 (výchozí), "15min" = M15
+OUTPUT_PATH   = (
+    "data/eurusd_clean.parquet"
+    if RESAMPLE_FREQ == "5min"
+    else f"data/eurusd_clean_{RESAMPLE_FREQ.replace('min', 'm')}.parquet"
+)
 
 ATR_PERIOD  = 14
 RSI_PERIOD  = 14
@@ -31,10 +36,13 @@ ATR_LONG_PERIOD   = 100           # dlouhodobý ATR pro volatility compression
 PIP_SIZE          = 0.0001        # EURUSD: 1 pip = 0.0001
 CET_TZ      = "Europe/Berlin"   # CET (UTC+1) / CEST (UTC+2) s DST
 
-# Triple Barrier Method (TBM)  –  24 M5 barů = 2 hodiny
-TBM_HORIZON  = 24    # počet budoucích M5 svíček (24 × 5 min = 120 min)
-TBM_PT_MULT  = 3.0   # Profit Taking bariéra = ATR(14) × TBM_PT_MULT
-TBM_SL_MULT  = 2.0   # Stop Loss bariéra  = ATR(14) × TBM_SL_MULT
+ER_WINDOW    = 10   # počet barů pro Efficiency Ratio (Kaufman ER)
+
+# Triple Barrier Method (TBM)  –  cílový čas = 120 minut
+_TBM_HORIZONS = {"5min": 24, "15min": 8, "1min": 120}
+TBM_HORIZON   = _TBM_HORIZONS.get(RESAMPLE_FREQ, 24)  # barů do exitu
+TBM_PT_MULT   = 3.0   # Profit Taking bariéra = ATR(14) × TBM_PT_MULT
+TBM_SL_MULT   = 2.0   # Stop Loss bariéra  = ATR(14) × TBM_SL_MULT
 ATR_200_PERIOD    = 200   # pro Vol Persistence feature
 ATR_TRADABLE_PIPS = 1.5   # minimální ATR(14) v pipech pro is_tradable (uvolněno z 2.5)
 
@@ -156,7 +164,7 @@ def main() -> None:
 
     # ── Resample M1 → M5 ──────────────────────────────────────────────────────
     print("Resampluju M1 → M5 (5minutové svíčky)...")
-    df = df[["open", "high", "low", "close", "tick_volume", "spread"]].resample("5min").agg({
+    df = df[["open", "high", "low", "close", "tick_volume", "spread"]].resample(RESAMPLE_FREQ).agg({
         "open":        "first",
         "high":        "max",
         "low":         "min",
@@ -164,7 +172,7 @@ def main() -> None:
         "tick_volume": "sum",
         "spread":      "last",
     }).dropna(subset=["open", "close"])
-    print(f"Po resamplu: {len(df):,} M5 řádků.")
+    print(f"Po resamplu: {len(df):,} {RESAMPLE_FREQ}-barů.")
 
     open_  = df["open"]
     high   = df["high"]
@@ -449,6 +457,43 @@ def main() -> None:
         ((close_t1 - asia_l_m1) / PIP_SIZE).astype("float32")
     )
 
+    # ── Market Regime Features ─────────────────────────────────────────────────────
+    print("Počítám Market Regime features (ER, Vol Regime Z-score, Tick Log Ratio)...")
+
+    # Efficiency Ratio (Kaufman ER): míra trendovosti.
+    # ER = abs(directional_move) / sum(abs(step_i))
+    # ER ≈ 1 → silný trend,  ER ≈ 0 → šum / konsolidace.
+    # Leakage guard: close.shift(1)..close.shift(ER_WINDOW+1) → pouze uzavřené svíčky.
+    directional = (close.shift(1) - close.shift(ER_WINDOW + 1)).abs()
+    path_length = pd.concat(
+        [(close.shift(k) - close.shift(k + 1)).abs() for k in range(1, ER_WINDOW + 1)],
+        axis=1,
+    ).sum(axis=1)
+    out["preprocessed_er"] = (
+        (directional / path_length.replace(0, np.nan)).clip(0, 1).astype("float32")
+    )
+
+    # Volatility Regime Z-score: Z-score ATR(200) vůči svému vlastnímu rolling průměru.
+    # Říká modelu, zda je strukturní volatilita historicky vysoká nebo nízká.
+    # Leakage guard: rolling(VOL_ZSCORE_WINDOW).shift(1) → okno [T-500…T-1].
+    vol_regime_mean = (
+        atr200.rolling(VOL_ZSCORE_WINDOW, min_periods=VOL_ZSCORE_WINDOW).mean().shift(1)
+    )
+    vol_regime_std = (
+        atr200.rolling(VOL_ZSCORE_WINDOW, min_periods=VOL_ZSCORE_WINDOW).std().shift(1)
+    )
+    out["preprocessed_vol_regime_zscore"] = (
+        (atr200 - vol_regime_mean) / vol_regime_std.replace(0, np.nan)
+    ).astype("float32")
+
+    # Tick Log Ratio: log(tick_volume / rolling_mean(tick_volume, 50)).
+    # Logaritmická škála lépe zachytí extrémní objemové spiky než lineární volume_surge.
+    # Leakage guard: rolling(50).mean().shift(1) → okno [T-50…T-1].
+    vol_ma50 = volume.rolling(50, min_periods=50).mean().shift(1)
+    out["preprocessed_tick_log_ratio"] = np.log(
+        (volume / vol_ma50.replace(0, np.nan)).clip(1e-6, None)
+    ).astype("float32")
+
     # ── Target + TBM outcome ─────────────────────────────────────────────────
     out["preprocessed_target"] = target
     out["tbm_outcome"]          = tbm_outcome   # 1=TP, 0=SL, 2=Timeout (není feature)
@@ -487,3 +532,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

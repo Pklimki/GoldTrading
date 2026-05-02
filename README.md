@@ -8,23 +8,31 @@ Robustní machine-learning pipeline pro 1-minutová data EURUSD s absolutní eli
 
 ```
 src/
-  preprocess.py   – Feature engineering → data/eurusd_clean.parquet
-  train.py        – LightGBM trénink + OOS evaluace → models/lgbm_clean_v1.pkl
+  preprocess.py   – Feature engineering → data/eurusd_clean.parquet (M5) nebo eurusd_clean_15m.parquet (M15)
+  train.py        – LightGBM trénink + Platt Scaling kalibrace + OOS evaluace → models/lgbm_clean_v1.pkl
   backtest.py     – Simulace obchodů na OOS datech → data/backtest_oos_results.parquet
+  stress_test.py  – Walk-forward stress test (3 cykly + M15 bonus)
   models.py       – Továrna modelů: get_model(name), get_config_params(name)
 data/
-  EURUSD_M1_full.parquet   – Surová M1 data (vstup)
-  eurusd_clean.parquet     – Vyčištěná data s features (výstup preprocessingu)
+  EURUSD_M1_full.parquet      – Surová M1 data (vstup)
+  eurusd_clean.parquet        – M5 data s features (665 514 řádků, 62 sloupců)
+  eurusd_clean_15m.parquet    – M15 data s features (218 368 řádků, 62 sloupců)
 models/
-  lgbm_clean_v1.pkl        – Natrénovaný model
+  lgbm_clean_v1.pkl           – Natrénovaný model (dict: {"lgbm": model, "platt": platt})
 ```
 
 ## Spuštění
 
 ```bash
-python src/preprocess.py   # 1. Vytvořit features
-python src/train.py        # 2. Trénovat model
-python src/backtest.py     # 3. OOS backtest
+# Preprocessing – M5 (výchozí)
+python src/preprocess.py
+
+# Preprocessing – M15 (nastavit RESAMPLE_FREQ="15min" v preprocess.py)
+python src/preprocess.py
+
+python src/train.py        # Trénovat model + Platt Scaling
+python src/backtest.py     # OOS backtest
+python src/stress_test.py  # Walk-forward stress test (3 cykly + M15 bonus)
 ```
 
 ---
@@ -57,6 +65,9 @@ Všechny features mají prefix `preprocessed_`. Target (`preprocessed_target`) j
 |---|---|---|
 | `preprocessed_atr14_norm` | ATR(14) dělený close – normalizovaná volatilita | Wilderovo EWM, min_periods=14 |
 | `preprocessed_vol_zscore` | Z-score ATR(14) vůči rolling(500) průměru/std – indikátor volatilitního režimu (mrtvý trh vs. news chaos) | rolling okno [t−500…t], bez budoucnosti |
+| `preprocessed_vol_regime_zscore` | Z-score ATR(200) vůči rolling(500) průměru/std – dlouhodobý volatilitní režim | `atr200.shift(1)` a rolling(500) z [t−501…t−1] |
+| `preprocessed_er` | Efficiency Ratio (Kaufman ER) za 10 svíček: pohyb/šum – detekuje trending vs. choppy trh | `close.shift(1..11)` – bez aktuální svíčky |
+| `preprocessed_tick_log_ratio` | log(tick_volume / rolling_mean(tick_volume, 50)) – relativní aktivita obchodníků vůči baseline | `rolling(50).mean().shift(1)` |
 
 ### Trend (M1)
 
@@ -155,20 +166,79 @@ Všechny lagy používají `.shift(n)` → hodnota z uzavřené svíčky T−n, 
 
 | Konfigurace | Popis | Klíčové parametry |
 |---|---|---|
-| `default` | Vyvážený model pro maximální coverage | `n_estimators=1000, lr=0.01, max_depth=6, num_leaves=31` |
+| `default` | Vyvážený model pro maximální coverage | `n_estimators=1000, lr=0.01, max_depth=6, num_leaves=31, min_child_samples=50` |
 | `conservative` | Konzervativní model s L1/L2 regularizací | `n_estimators=1500, lr=0.005, max_depth=4, num_leaves=15, reg_alpha=0.1, reg_lambda=0.1` |
 
 Přidání nové konfigurace: doplň záznam do `_CONFIGS` v `src/models.py`.
 
 ---
 
-## Poslední OOS výsledky (model: `default`, test: 2025-01-01 →)
+## Kalibrace pravděpodobností (Platt Scaling)
 
-| Threshold | Precision Long | Recall Long | Coverage | N Long |
-|---|---|---|---|---|
-| 0.50 | 50.8% | 6.0% | 5.62% | 25 311 |
-| 0.52 | 53.3% | 0.8% | 0.74% | 3 338 |
-| 0.55 | 56.0% | 0.1% | 0.11% | 518 |
-| 0.60 | 59.8% | 0.02% | 0.02% | 87 |
+Po tréningu LightGBM je model kalibrován pomocí **Platt Scaling** (logistická regrese na raw LGB pravděpodobnostech).
 
-AUC (Long): **0.524** | Top feature: `preprocessed_atr14_norm`
+- Kalibrační sada: posledních 15 % tréninku (min. 5 000 vzorků)
+- Kalibruje distribuci od `[0.21, 0.58]` na `[0.06, 0.84]` – model generuje ostřejší anomálie
+- Implementace: `sklearn.linear_model.LogisticRegression(C=1.0)` na raw probs z train sady
+- Uloženo jako dict `{"lgbm": model, "platt": platt}` v `lgbm_clean_v1.pkl`
+
+> **Poznámka**: `CalibratedClassifierCV(cv='prefit')` byl odstraněn ze sklearn 1.3+. Vždy použij manuální Platt Scaling.
+
+---
+
+## Dynamický práh signálu
+
+Místo fixního prahu se signál generuje pouze při **statistické anomálii** v distribuci predikce:
+
+```
+signal[t] = prob1[t] > rolling_mean(prob1, 500) + 1.5 × rolling_std(prob1, 500)
+```
+
+- Adaptuje se na změny distribuce modelu v čase (market regime shifts)
+- `DYNAMIC_WINDOW=500`, `DYNAMIC_SIGMA=1.5` v `src/stress_test.py`
+- Generuje ~7–9 % coverage (vs. fixní 0.47 → 3.9 %)
+
+---
+
+## M15 podpora
+
+`src/preprocess.py` podporuje přepnutí časového rámce přes konstantu `RESAMPLE_FREQ`:
+
+```python
+RESAMPLE_FREQ = "5min"   # M5 (výchozí) → eurusd_clean.parquet
+RESAMPLE_FREQ = "15min"  # M15          → eurusd_clean_15m.parquet
+```
+
+- `TBM_HORIZON` se automaticky přizpůsobí: M5=24 barů (2 h), M15=8 barů (2 h)
+- `stress_test.py` spouští M15 bonus cyklus na `eurusd_clean_15m.parquet` automaticky (pokud soubor existuje)
+
+---
+
+## Walk-Forward Stress Test (`src/stress_test.py`)
+
+Tři opakované cykly trénink → test bez data leakage:
+
+| Cyklus | Trénink | Test | AUC | N obchodů | Win% | Avg Pips |
+|---|---|---|---|---|---|---|
+| A | 2016–2022 | 2023 | 0.6072 | 5 264 | 41.0% | −1.37 |
+| B | 2016–2023 | 2024 | 0.6072 | 3 238 | 38.3% | −1.58 |
+| C | 2016–2024 | 2025+ | 0.6123 | 6 541 | 41.0% | −1.20 |
+| M15 C | 2016–2024 | 2025+ (M15) | 0.6994 | 2 749 | 42.5% | −1.02 |
+
+TBM parametry: PT=3×ATR, SL=2×ATR, Spread=1.5 pip, Horizon=24 barů (M5) / 8 barů (M15).  
+Práh: dynamický (rolling 500 + 1.5σ). M15 dosahuje AUC 0.70, výrazně lepší separace.
+
+**Top-5 features (průměr přes cykly):** `range_24h`, `close_vs_7d_highlow`, `atr14_norm`, `dist_london_open`, **`vol_regime_zscore`** (nová #5)
+
+---
+
+## Poslední OOS výsledky (stress test walk-forward, dynamický práh σ=1.5)
+
+| Cyklus | Test | AUC | N obchodů | Win% | Avg Pips | Total Pips |
+|---|---|---|---|---|---|---|
+| A | 2023 | 0.6072 | 5 264 | 41.0% | −1.37 | −7 232 |
+| B | 2024 | 0.6072 | 3 238 | 38.3% | −1.58 | −5 122 |
+| C | 2025+ | 0.6123 | 6 541 | 41.0% | −1.20 | −7 852 |
+| M15 C | 2025+ (M15) | 0.6994 | 2 749 | 42.5% | −1.02 | −2 807 |
+
+Výsledky ukazují konzistentní AUC ~0.61 napříč cykly. Statické prahy 0.55–0.60 dosahují precision 37–66 % (cyklus B thr=0.60: precision=66 %), ale velmi nízkou coverage. Dynamický práh generuje více obchodů, ale stále nedosahuje breakeven (nutná precision >60 % pro R:R=3:2).

@@ -21,6 +21,7 @@ from sklearn.metrics import (
     roc_auc_score,
     classification_report,
 )
+from sklearn.linear_model import LogisticRegression
 from models import get_model, get_config_params
 
 INPUT_PATH  = "data/eurusd_clean.parquet"
@@ -103,9 +104,20 @@ def main() -> None:
     best_iter = model.best_iteration_
     print(f"\nNejlepší iterace (early stopping): {best_iter}")
 
-    # ── Predikce na OOS datech ────────────────────────────────────────────────
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)[:, 1]
+    # ── Platt Scaling – post-hoc kalibrace pravděpodobností ──────────────────────
+    # Logistická regrese na raw probách modelu → kalibrované pravděpodobnosti.
+    # Cal set = chronologicky posledních 15 % trn. dat (bez dotyku test setu).
+    cal_size = max(5_000, int(len(X_train) * 0.15))
+    X_cal    = X_train.iloc[-cal_size:]
+    y_cal    = y_train.iloc[-cal_size:]
+    print(f"Kalibruji pravděpodobnosti (Platt Scaling, cal set = {len(X_cal):,} řádků)...")
+    raw_cal  = model.predict_proba(X_cal)[:, 1].reshape(-1, 1)
+    platt    = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
+    platt.fit(raw_cal, y_cal)
+
+    # ── Predikce na OOS datech ────────────────────────────────────────────
+    y_prob = platt.predict_proba(model.predict_proba(X_test)[:, 1].reshape(-1, 1))[:, 1]
+    y_pred = (y_prob >= 0.5).astype(int)
 
     # ── Metriky ────────────────────────────────────────────────────────────────
     auc        = roc_auc_score(y_test, y_prob)
@@ -161,8 +173,9 @@ def main() -> None:
     print(importance.head(10).to_string())
 
     # ── Uložení modelu ─────────────────────────────────────────────────────────
-    joblib.dump(model, MODEL_PATH)
-    print(f"\nModel uložen do '{MODEL_PATH}'.")
+    # Uloží se tuple {lgbm, platt} pro replikovatelnost.
+    joblib.dump({"lgbm": model, "platt": platt}, MODEL_PATH)
+    print(f"\nModel (LGBM + Platt Scaler) uložen do '{MODEL_PATH}'.")
 
 
 if __name__ == "__main__":
