@@ -23,7 +23,19 @@ EMA_LONG    = 200
 H1_EMA_LEN  = 200   # EMA pro MTF H1 trend
 VOL_ZSCORE_WINDOW = 500
 VOL_SURGE_WINDOW  = 20
+RANGE_24H_BARS    = 1440          # 1 440 minut = 24 hodin
+RANGE_7D_BARS     = 10_080        # 10 080 minut = 7 dní
+LAG_PERIODS       = (1, 2, 3, 5)  # lagy pro krátkou paměť
+SWING_WINDOW      = 20            # okno pro detekci swing high/low
+ATR_LONG_PERIOD   = 100           # dlouhodobý ATR pro volatility compression
+PIP_SIZE          = 0.0001        # EURUSD: 1 pip = 0.0001
 CET_TZ      = "Europe/Berlin"   # CET (UTC+1) / CEST (UTC+2) s DST
+
+# Triple Barrier Method (TBM)
+TBM_HORIZON  = 60    # počet budoucích svíček (60 minut)
+TBM_PT_MULT  = 2.0   # Profit Taking bariéra = ATR(14) × TBM_PT_MULT
+TBM_SL_MULT  = 1.5   # Stop Loss bariéra  = ATR(14) × TBM_SL_MULT (asymetrické RRR)
+ATR_200_PERIOD = 200 # pro Vol Persistence feature
 
 
 # ── Pomocné funkce ─────────────────────────────────────────────────────────────
@@ -50,6 +62,81 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def compute_tbm_labels(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    horizon: int = TBM_HORIZON,
+    pt_arr: np.ndarray = None,  # abs. vzdálenost TP od Close per bar (price units)
+    sl_arr: np.ndarray = None,  # abs. vzdálenost SL od Close per bar (price units)
+) -> tuple:
+    """
+    Triple Barrier Method – vektorizovaná implementace (numpy stride tricks).
+
+    Bariéry jsou dynamické (per-bar), typicky ATR-násobky:
+      pt_arr = ATR(14) * TBM_PT_MULT   → TP úroveň = Close(T) + pt_arr[T]
+      sl_arr = ATR(14) * TBM_SL_MULT   → SL úroveň = Close(T) - sl_arr[T]
+
+    Pro každou svíčku T kontroluje budoucí okno T+1 … T+horizon:
+      - Pokud High(T+k) >= Close(T) + pt_arr[T] první → label = 1 (TP)
+      - Pokud Low(T+k)  <= Close(T) - sl_arr[T] první → label = 0 (SL)
+      - Pokud žádná bariéra není zasažena              → label = 0 (Timeout)
+      - Tie (stejný bar zasáhne obě)                   → label = 0 (konzervativní)
+
+    Posledních `horizon` řádků dostane NaN (chybí budoucnost).
+
+    Returns
+    -------
+    labels  : pd.Series  float64  – 1 = TP, 0 = SL/Timeout
+    outcome : pd.Series  float64  – 1 = TP, 0 = SL, 2 = Timeout  (pro reporting)
+    """
+    pt = np.asarray(pt_arr, dtype="float64")
+    sl = np.asarray(sl_arr, dtype="float64")
+
+    n          = len(close)
+    close_arr  = np.asarray(close, dtype="float64")
+    high_arr   = np.asarray(high,  dtype="float64")
+    low_arr    = np.asarray(low,   dtype="float64")
+
+    # Okna budoucích high/low: shape (n - horizon, horizon)
+    # win_h[i, k] = high[i + k + 1],  k = 0 … horizon-1
+    win_h = np.lib.stride_tricks.sliding_window_view(high_arr, horizon + 1)[:, 1:]
+    win_l = np.lib.stride_tricks.sliding_window_view(low_arr,  horizon + 1)[:, 1:]
+
+    m        = win_h.shape[0]              # počet barů s plným oknem
+    tp_level = close_arr[:m] + pt[:m]      # (m,) – per-bar TP
+    sl_level = close_arr[:m] - sl[:m]      # (m,) – per-bar SL
+
+    tp_hits = win_h >= tp_level[:, None]   # (m, horizon) bool
+    sl_hits = win_l <= sl_level[:, None]
+
+    # Index prvního zásahu (0-based v okně); horizon = "nikdy nezasaženo"
+    tp_first = np.where(tp_hits.any(axis=1), tp_hits.argmax(axis=1), horizon)
+    sl_first = np.where(sl_hits.any(axis=1), sl_hits.argmax(axis=1), horizon)
+
+    # Label: 1 pouze pokud TP zasažen STRIKTNĚ před SL
+    labels_arr = np.where(tp_first < sl_first, 1.0, 0.0)
+
+    # Outcome pro reporting: 1=TP, 0=SL, 2=Timeout
+    outcome_arr = np.select(
+        [tp_first < sl_first,   # TP hit first
+         sl_first < horizon],   # SL hit first (nebo tie)
+        [1, 0],
+        default=2,              # žádná bariéra → timeout
+    ).astype("float64")
+
+    # Posledních `horizon` řádků → NaN
+    labels_full  = np.full(n, np.nan)
+    outcome_full = np.full(n, np.nan)
+    labels_full[:m]  = labels_arr
+    outcome_full[:m] = outcome_arr
+
+    return (
+        pd.Series(labels_full,  index=close.index),
+        pd.Series(outcome_full, index=close.index),
+    )
+
+
 # ── Hlavní funkce ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -73,11 +160,22 @@ def main() -> None:
     safe_atr = atr14.replace(0, np.nan)
     hl_range = (high - low).replace(0, np.nan)
 
-    # ── Target (BUDOUCNOST t+1) ────────────────────────────────────────────────
-    # POZOR: close.shift(-1) je výhradně pro label – NIKDY do features!
-    next_close = close.shift(-1)
-    target     = (next_close > close).astype("float64")
-    target.loc[next_close.isna()] = np.nan   # poslední řádek nemá budoucnost
+    # ── Target: Triple Barrier Method (dynamické ATR bariéry) ─────────────────
+    # POZOR: používá budoucí high/low (T+1..T+horizon) VÝHRADNĚ pro label.
+    # PT = ATR(14)[T] × TBM_PT_MULT,  SL = ATR(14)[T] × TBM_SL_MULT
+    print(f"Počítám TBM target (horizon={TBM_HORIZON}, PT=ATR×{TBM_PT_MULT}, SL=ATR×{TBM_SL_MULT})...")
+    target, tbm_outcome = compute_tbm_labels(
+        close, high, low,
+        horizon = TBM_HORIZON,
+        pt_arr  = (atr14 * TBM_PT_MULT).values,
+        sl_arr  = (atr14 * TBM_SL_MULT).values,
+    )
+    # Statistika TBM (informativní výpis)
+    m_valid = tbm_outcome.notna().sum()
+    tp_pct  = (tbm_outcome == 1).sum() / m_valid * 100
+    sl_pct  = (tbm_outcome == 0).sum() / m_valid * 100
+    to_pct  = (tbm_outcome == 2).sum() / m_valid * 100
+    print(f"TBM distribuce: TP={tp_pct:.1f}%  SL={sl_pct:.1f}%  Timeout={to_pct:.1f}%")
 
     # ── Výstupní DataFrame ─────────────────────────────────────────────────────
     out = pd.DataFrame(index=df.index)
@@ -87,13 +185,15 @@ def main() -> None:
     upper_shadow = high - pd.concat([open_, close], axis=1).max(axis=1)
     lower_shadow = pd.concat([open_, close], axis=1).min(axis=1) - low
 
-    out["preprocessed_body_atr"]         = body         / safe_atr
+    body_atr_raw = body / safe_atr
+    out["preprocessed_body_atr"]         = body_atr_raw
     out["preprocessed_upper_shadow_atr"] = upper_shadow / safe_atr
     out["preprocessed_lower_shadow_atr"] = lower_shadow / safe_atr
     out["preprocessed_close_pos"]        = (close - low) / hl_range  # [0, 1]
 
     # ── Momentum ───────────────────────────────────────────────────────────────
-    out["preprocessed_rsi14"] = compute_rsi(close, RSI_PERIOD)
+    rsi14_raw = compute_rsi(close, RSI_PERIOD)
+    out["preprocessed_rsi14"] = rsi14_raw
     out["preprocessed_roc5"]  = close.pct_change(5)
     out["preprocessed_roc10"] = close.pct_change(10)
     out["preprocessed_roc20"] = close.pct_change(20)
@@ -134,9 +234,99 @@ def main() -> None:
     # Poměr aktuálního volume vůči průměru 20 předchozích svíček.
     # shift(1) zajistí, že průměr je z [t-20 … t-1], nikoli [t-19 … t].
     vol_ma20 = volume.rolling(VOL_SURGE_WINDOW, min_periods=VOL_SURGE_WINDOW).mean().shift(1)
-    out["preprocessed_volume_surge"] = (
-        volume / vol_ma20.replace(0, np.nan)
+    volume_surge_raw = (volume / vol_ma20.replace(0, np.nan))
+    out["preprocessed_volume_surge"] = volume_surge_raw.astype("float32")
+
+    # ── Lagged Features (krátká paměť) ────────────────────────────────────────
+    # Každý lag .shift(n) dává hodnotu uzavřené svíčky z T-n.
+    # Model vidí gradient: roste RSI? Graduje volume? Zrychluje se tělo?
+    print("Počítám lagged features...")
+    for lag in LAG_PERIODS:
+        out[f"preprocessed_body_atr_lag{lag}"]     = body_atr_raw.shift(lag).astype("float32")
+        out[f"preprocessed_rsi14_lag{lag}"]        = rsi14_raw.shift(lag).astype("float32")
+        out[f"preprocessed_volume_surge_lag{lag}"] = volume_surge_raw.shift(lag).astype("float32")
+
+    # ── Rolling Trend Windows (dlouhá paměť) ──────────────────────────────────
+    # Vždy shift(1): okno [T-N … T-1], nikdy T.
+    print("Počítám rolling trend windows...")
+
+    # 24h range: (max(high) - min(low)) za posledních 1440 minut
+    high_24h = high.rolling(RANGE_24H_BARS, min_periods=RANGE_24H_BARS).max().shift(1)
+    low_24h  = low.rolling(RANGE_24H_BARS, min_periods=RANGE_24H_BARS).min().shift(1)
+    out["preprocessed_range_24h"] = (high_24h - low_24h).astype("float32")
+
+    # 7d high-low kanál: kde je aktuální close v rámci 7denního kanálu (0–1)
+    high_7d  = high.rolling(RANGE_7D_BARS, min_periods=RANGE_7D_BARS).max().shift(1)
+    low_7d   = low.rolling(RANGE_7D_BARS, min_periods=RANGE_7D_BARS).min().shift(1)
+    range_7d = (high_7d - low_7d).replace(0, np.nan)
+    out["preprocessed_close_vs_7d_highlow"] = ((close - low_7d) / range_7d).astype("float32")
+
+    # H1 EMA200 slope: (EMA200[T-1] - EMA200[T-4]) / 3 na H1 = sklon za 3 hodiny
+    # h1_ema200_lagged je již posunutá o 1 H1 bar (viz výše) → beze extra leakage
+    h1_slope_raw  = (h1_ema200_lagged - h1_ema200_lagged.shift(3)) / 3.0
+    out["preprocessed_slope_ema200_h1"] = (
+        h1_slope_raw.reindex(close.index, method="ffill")
     ).astype("float32")
+
+    # ── Advanced Price Action ──────────────────────────────────────────────────
+    print("Počítám advanced price action features...")
+
+    # Swing Points: je předchozí High/Low lokálním extrémen za 20 svíček?
+    # Vždy shift(1) – porovnáváme uzavřenou svíčku T-1 s oknem [T-20…T-1].
+    high_shifted  = high.shift(1)
+    low_shifted   = low.shift(1)
+    roll_max_high = high.rolling(SWING_WINDOW, min_periods=SWING_WINDOW).max().shift(1)
+    roll_min_low  = low.rolling(SWING_WINDOW, min_periods=SWING_WINDOW).min().shift(1)
+    out["preprocessed_is_high_20"] = (high_shifted == roll_max_high).astype("float32")
+    out["preprocessed_is_low_20"]  = (low_shifted  == roll_min_low).astype("float32")
+
+    # Volatility Compression: poměr krátkodobého ATR vs. dlouhodobého ATR
+    # < 1 = komprese (konsolidace), > 1 = expanze
+    atr100 = compute_atr(high, low, close, ATR_LONG_PERIOD)
+    out["preprocessed_atr_ratio"] = (
+        (atr14 / atr100.replace(0, np.nan)).astype("float32")
+    )
+
+    # Price Extremes: vzdálenost Close(T-1) od 24h High v pipech
+    # Záporná hodnota = close je pod 24h high (čím větší abs, tím dál)
+    out["preprocessed_dist_from_24h_high"] = (
+        ((close.shift(1) - high_24h) / PIP_SIZE).astype("float32")
+    )
+
+    # Momentum Climax: počet po sobě jdoucích svíček se stejným znaménkem body
+    # Kladné tělo (Up) = close > open, záporné (Down) = close < open
+    body_sign = np.sign(close - open_)   # +1, -1 nebo 0
+    body_sign_shifted = body_sign.shift(1)
+
+    def _consecutive_same_sign(s: pd.Series) -> pd.Series:
+        """Počítá délku aktuální série shodných znaménk (zpětně)."""
+        arr    = s.values
+        result = np.zeros(len(arr), dtype="float32")
+        count  = 0
+        for i in range(len(arr)):
+            if i == 0 or arr[i] == 0 or arr[i] != arr[i - 1]:
+                count = 1 if arr[i] != 0 else 0
+            else:
+                count += 1
+            result[i] = count
+        return pd.Series(result, index=s.index)
+
+    out["preprocessed_consecutive_bars"] = _consecutive_same_sign(body_sign_shifted)
+
+    # ── Time-to-Touch Features ─────────────────────────────────────────────────
+    # Vol Persistence: ATR(14) / ATR(200) — tempo krátkodobé vs. strukturální volatility.
+    # < 1 = klidný trh (ATR14 pod průměrem), > 1 = zrychlení pohybu.
+    atr200 = compute_atr(high, low, close, ATR_200_PERIOD)
+    out["preprocessed_vol_persistence"] = (
+        (atr14 / atr200.replace(0, np.nan)).astype("float32")
+    )
+
+    # Price Speed: (Close[T-1] - Close[T-10]) / ATR(14) — rychlost pohybu v jednotkách ATR.
+    # Kladné = vzestupný impulz za 10 svíček, záporné = sestupný.
+    # Leakage guard: close.shift(1) a close.shift(10) → pouze uzavřené svíčky.
+    out["preprocessed_price_speed"] = (
+        ((close.shift(1) - close.shift(10)) / safe_atr).astype("float32")
+    )
 
     # ── Time & Sessions ────────────────────────────────────────────────────────
     cet_idx     = df.index.tz_convert(CET_TZ)
@@ -168,15 +358,78 @@ def main() -> None:
     out["preprocessed_dow_sin"] = np.sin(dow_angle).astype("float32")
     out["preprocessed_dow_cos"] = np.cos(dow_angle).astype("float32")
 
-    # ── Target ────────────────────────────────────────────────────────────────
-    out["preprocessed_target"] = target
+    # ── Smart Money Concepts (SMC) ─────────────────────────────────────────────
+    # LEAKAGE GUARD: veškerá data z předchozích uzavřených svíček.
+    #   close_t1     = close[T-1]  (uzavřená svíčka)
+    #   daily_* .shift(1) → datum D čte hodnotu z D-1
+    #   asia_*  .shift(1) → datum D čte asijský rozsah z D-1
+    print("Počítám SMC features (PDH/PDL, FVG, Asia Range)...")
 
-    # ── Základní OHLC + spread pro backtest (bez prefixu) ────────────────────
+    close_t1     = close.shift(1)           # Close uzavřené svíčky T-1
+    cet_date_arr = cet_idx.normalize()       # CET půlnoc pro každý M1 bar (tz-aware)
+
+    # --- Previous Day High / Low (PDH / PDL) ----------------------------------
+    # high.groupby(cet_date_arr) → jeden řádek na každý obchodní den (CET)
+    # .shift(1) → datum D dostane H/L z D-1 → bez úniku dat
+    daily_high = high.groupby(cet_date_arr).max()
+    daily_low  = low.groupby(cet_date_arr).min()
+    pdh_series = daily_high.shift(1)   # pro datum D → D-1 daily high
+    pdl_series = daily_low.shift(1)    # pro datum D → D-1 daily low
+
+    # Zpětné mapování na M1 pomocí CET date jako klíče
+    date_mapper = pd.Series(cet_date_arr, index=df.index)
+    pdh_m1 = date_mapper.map(pdh_series)
+    pdl_m1 = date_mapper.map(pdl_series)
+
+    # Vzdálenosti Close(T-1) od PDH/PDL v pipech (+ = nad úrovní, − = pod)
+    out["preprocessed_pdh_dist"] = (
+        ((close_t1 - pdh_m1) / PIP_SIZE).astype("float32")
+    )
+    out["preprocessed_pdl_dist"] = (
+        ((close_t1 - pdl_m1) / PIP_SIZE).astype("float32")
+    )
+
+    # --- Fair Value Gap (FVG) -------------------------------------------------
+    # Bullish FVG: High[T-2] < Low[T]  → kladný gap (Low[T] − High[T-2])
+    # Bearish FVG: Low[T-2]  > High[T] → záporný gap (High[T] − Low[T-2])
+    # Používáme uzavřená data svíčky T a T-2 → bez úniku dat.
+    bull_fvg = (low  - high.shift(2)).clip(lower=0)   # > 0 pro bullish FVG
+    bear_fvg = (high - low.shift(2)).clip(upper=0)    # < 0 pro bearish FVG
+    out["preprocessed_fvg_size"] = (
+        ((bull_fvg + bear_fvg) / PIP_SIZE).astype("float32")
+    )
+
+    # --- Asian Session Range Distances ----------------------------------------
+    # Asijská seance: 00:00–09:00 CET (asia_mask definována výše v sekci Sessions)
+    # Pro bar T → H/L asijské seance z PŘEDCHOZÍHO obchodního dne (D-1).
+    high_asia_only  = high.where(asia_mask)          # NaN mimo asijskou seanci
+    low_asia_only   = low.where(asia_mask)
+    asia_daily_high = high_asia_only.groupby(cet_date_arr).max()
+    asia_daily_low  = low_asia_only.groupby(cet_date_arr).min()
+    asia_prev_high  = asia_daily_high.shift(1)       # D → D-1 Asia session high
+    asia_prev_low   = asia_daily_low.shift(1)        # D → D-1 Asia session low
+
+    asia_h_m1 = date_mapper.map(asia_prev_high)
+    asia_l_m1 = date_mapper.map(asia_prev_low)
+
+    out["preprocessed_asia_high_dist"] = (
+        ((close_t1 - asia_h_m1) / PIP_SIZE).astype("float32")
+    )
+    out["preprocessed_asia_low_dist"] = (
+        ((close_t1 - asia_l_m1) / PIP_SIZE).astype("float32")
+    )
+
+    # ── Target + TBM outcome ─────────────────────────────────────────────────
+    out["preprocessed_target"] = target
+    out["tbm_outcome"]          = tbm_outcome   # 1=TP, 0=SL, 2=Timeout (není feature)
+
+    # ── Základní OHLC + spread + ATR pro backtest (bez prefixu) ─────────────
     out["open"]   = open_.values
     out["high"]   = high.values
     out["low"]    = low.values
     out["close"]  = close.values
     out["spread"] = df["spread"].values   # raw spread v bodech (MT5 points)
+    out["atr14"]  = atr14.values          # ATR(14) pro TBM simulaci v backtestu
 
     # ── Čistění – odstraň NaN (warmup + poslední řádek bez targetu) ───────────
     rows_before = len(out)

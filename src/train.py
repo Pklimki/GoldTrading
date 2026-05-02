@@ -21,6 +21,7 @@ from sklearn.metrics import (
     roc_auc_score,
     classification_report,
 )
+from models import get_model, get_config_params
 
 INPUT_PATH  = "data/eurusd_clean.parquet"
 MODEL_PATH  = "models/lgbm_clean_v1.pkl"
@@ -71,18 +72,24 @@ def main() -> None:
     print(f"\nDistribuce targetu (train): {y_train.value_counts().to_dict()}")
     print(f"Distribuce targetu (test):  {y_test.value_counts().to_dict()}")
 
-    # ── Model ──────────────────────────────────────────────────────────────────
-    model = lgb.LGBMClassifier(
-        n_estimators  = 1000,
-        learning_rate = 0.01,
-        max_depth     = 6,
-        num_leaves    = 31,
-        random_state  = 42,
-        n_jobs        = -1,
-        verbose       = -1,
-    )
+    # ── TBM breakdown (TP / SL / Timeout) ─────────────────────────────────────
+    if "tbm_outcome" in df.columns:
+        def _tbm_stats(series: pd.Series, label: str) -> None:
+            total  = series.notna().sum()
+            tp_pct = (series == 1).sum() / total * 100
+            sl_pct = (series == 0).sum() / total * 100
+            to_pct = (series == 2).sum() / total * 100
+            print(f"  {label:6s}  TP={tp_pct:5.1f}%  SL={sl_pct:5.1f}%  Timeout={to_pct:5.1f}%")
+        print("TBM breakdown (1=TP, 0=SL, 2=Timeout):")
+        _tbm_stats(df["tbm_outcome"],                  "Celkem")
+        _tbm_stats(df["tbm_outcome"].loc[train_mask],  "Train ")
+        _tbm_stats(df["tbm_outcome"].loc[test_mask],   "Test  ")
 
-    print("\nTrénink modelu (early stopping = 50 rund)...")
+    # ── Model ──────────────────────────────────────────────────────────────────
+    MODEL_TYPE = "default"   # ← změň na "conservative" pro experimentování
+    model = get_model(MODEL_TYPE)
+    print(f"\nKonfigurace modelu: '{MODEL_TYPE}' → {get_config_params(MODEL_TYPE)}")
+    print("Trénink modelu (early stopping = 50 rund)...")
     model.fit(
         X_train,
         y_train,
@@ -123,6 +130,27 @@ def main() -> None:
         target_names=["Short (0)", "Long  (1)"],
         digits=4,
     ))
+
+    # ── Probability Thresholding ───────────────────────────────────────────────
+    # Zobraz vliv různých thresholdů na Precision / Recall / Coverage.
+    # Coverage = podíl obchodů, které threshold pustí dál.
+    THRESHOLDS = [0.50, 0.52, 0.55, 0.60]
+    print("\n" + "=" * 72)
+    print("  PROBABILITY THRESHOLDING  (Long signal = prob >= threshold)")
+    print("=" * 72)
+    print(f"  {'Threshold':>10}  {'Prec Long':>10}  {'Rec Long':>10}  "
+          f"{'Prec Short':>10}  {'Coverage':>10}  {'N Long':>8}")
+    print("-" * 72)
+    for thr in THRESHOLDS:
+        y_thr = np.where(y_prob >= thr, 1, 0)
+        pl = precision_score(y_test, y_thr, pos_label=1, zero_division=0)
+        rl = recall_score   (y_test, y_thr, pos_label=1, zero_division=0)
+        ps = precision_score(y_test, y_thr, pos_label=0, zero_division=0)
+        n_long    = int((y_thr == 1).sum())
+        coverage  = n_long / len(y_test) * 100
+        print(f"  {thr:>10.2f}  {pl:>10.4f}  {rl:>10.4f}  "
+              f"{ps:>10.4f}  {coverage:>9.2f}%  {n_long:>8,}")
+    print("=" * 72)
 
     # ── Feature importance (top 10) ────────────────────────────────────────────
     importance = pd.Series(
